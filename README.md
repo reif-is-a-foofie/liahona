@@ -260,6 +260,14 @@ Events
 - Test via curl:
   - `curl -N http://localhost:8000/rt/sse?project_id=p1`
 
+## WebSocket Realtime
+
+- Endpoint: `GET /rt/ws` (WebSocket upgrade)
+- Send initial JSON: `{"subscribe": ["project:p1", "task:t1"], "user_id": "u_alma"}`
+- Server emits SSE-like payloads and presence events:
+  - `presence.join`, `presence.leave`, `presence.typing` (client can send `{ "type": "typing", "project_id": "p1", "task_id": "t1" }`).
+- Presence (HTTP): `GET /rt/presence?project_id=p1`
+
 ---
 
 ## Real‑Time Updates (Events, Feeds, Outlines, Milestones)

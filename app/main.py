@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Dict, List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 import asyncio
 
@@ -561,6 +561,95 @@ async def sse(project_id: str | None = None):
             yield f"event: {evt.get('type','message')}\n" f"data: {data}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# --- WebSocket realtime (subscribe + presence) ---
+
+
+presence: Dict[str, set] = {}
+
+
+@app.websocket("/rt/ws")
+async def ws_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    # Minimal protocol:
+    # - Client may send a JSON message: {"subscribe": ["project:p1", "task:tid"], "user_id": "u_..."}
+    # - Server sends events with the same payload as SSE; filtered by topics.
+    topics_projects: set[str] = set()
+    topics_tasks: set[str] = set()
+    user_id = None
+    try:
+        # Try receiving initial subscribe message (optional)
+        init = await asyncio.wait_for(websocket.receive_text(), timeout=2.0)
+        try:
+            import json as _json
+            msg = _json.loads(init)
+        except Exception:
+            msg = {}
+        subs = msg.get("subscribe") or []
+        user_id = msg.get("user_id")
+        for s in subs:
+            if isinstance(s, str) and s.startswith("project:"):
+                topics_projects.add(s.split(":", 1)[1])
+            if isinstance(s, str) and s.startswith("task:"):
+                topics_tasks.add(s.split(":", 1)[1])
+    except Exception:
+        pass
+
+    # Presence join for each project subscribed
+    for pid in topics_projects:
+        presence.setdefault(pid, set()).add(user_id or "anon")
+        await bus.publish(pid, {"type": "presence.join", "project_id": pid, "actor": user_id or "anon", "ts": _iso(datetime.utcnow().replace(tzinfo=timezone.utc)), "data": {}})
+
+    async def sender():
+        async for evt in bus.subscribe(None):  # subscribe to all, filter
+            pid = evt.get("project_id")
+            tid = evt.get("task_id")
+            if (not topics_projects or pid in topics_projects) and (not topics_tasks or tid in topics_tasks or not tid):
+                try:
+                    import json as _json
+                    await websocket.send_text(_json.dumps(evt))
+                except Exception:
+                    break
+
+    send_task = asyncio.create_task(sender())
+    try:
+        while True:
+            # Keep the connection alive; accept pings/typing messages
+            try:
+                text = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                try:
+                    import json as _json
+                    msg = _json.loads(text)
+                except Exception:
+                    msg = {}
+                if msg.get("type") == "typing":
+                    pid = msg.get("project_id")
+                    tid = msg.get("task_id")
+                    if pid:
+                        await bus.publish(pid, {"type": "presence.typing", "project_id": pid, "task_id": tid, "actor": user_id or "anon", "ts": _iso(datetime.utcnow().replace(tzinfo=timezone.utc)), "data": {}})
+                # no-op for other messages
+            except asyncio.TimeoutError:
+                # send a ping-like event from server as comment to keep connection
+                try:
+                    await websocket.send_text("{}")
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        send_task.cancel()
+        for pid in topics_projects:
+            try:
+                presence.get(pid, set()).discard(user_id or "anon")
+                await bus.publish(pid, {"type": "presence.leave", "project_id": pid, "actor": user_id or "anon", "ts": _iso(datetime.utcnow().replace(tzinfo=timezone.utc)), "data": {}})
+            except Exception:
+                pass
+
+
+@app.get("/rt/presence")
+def get_presence(project_id: str):
+    return sorted(list(presence.get(project_id, set())))
 
 
 # Notifications endpoints
