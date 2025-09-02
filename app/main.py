@@ -185,6 +185,8 @@ def confirm_task(task_id: str, body: ConfirmRequest):
     task = _ensure_task(task_id)
     if task.status not in {TaskStatus.submitted, TaskStatus.confirmed, TaskStatus.accepted}:
         raise HTTPException(status_code=400, detail="Invalid transition")
+    if task.owner_id and body.reviewer_id == task.owner_id:
+        raise HTTPException(status_code=400, detail="Reviewer must be different from owner")
     decision = body.decision.lower()
     if decision == "approved":
         db.update_task(task.id, {"status": TaskStatus.confirmed.value})
@@ -600,6 +602,85 @@ def project_milestones(project_id: str):
         if st in counts:
             counts[st] += 1
     return counts
+
+
+@app.get("/projects/{project_id}/feed")
+def project_feed(project_id: str):
+    tasks = db.list_tasks_by_project(project_id)
+    feed: List[Dict[str, object]] = []
+    for t in tasks:
+        tid = t["id"]
+        for e in db.list_activity(tid):
+            feed.append({
+                "type": e["event"],
+                "ts": e["ts"],
+                "actor": e["by"],
+                "task_id": tid,
+                "project_id": project_id,
+                "data": e.get("metadata", {}),
+            })
+        for c in db.list_comments(tid):
+            feed.append({
+                "type": "comment",
+                "ts": c["timestamp"],
+                "actor": c["author_id"],
+                "task_id": tid,
+                "project_id": project_id,
+                "data": {"id": c["id"], "body": c["body"], "mentions": c["mentions"], "refs": c["refs"]},
+            })
+    feed.sort(key=lambda x: x["ts"])  # ascending
+    return feed
+
+
+# --- Brain endpoints (heuristic stubs) ---
+
+
+@app.post("/brain/split")
+def brain_split(task_title: Dict[str, str]):
+    title = (task_title.get("task_title") or "").strip()
+    parts = []
+    for sep in [" and ", ";", ",", " & "]:
+        if sep in title.lower():
+            parts = [p.strip().capitalize() for p in title.replace(";", ",").split(sep) if p.strip()]
+            break
+    if not parts:
+        # Try to extract two verbs heuristically
+        import re
+        verbs = re.findall(r"\b([a-z]{3,}?)\b", title.lower())
+        parts = [title] if len(verbs) <= 1 else title.split(" ", 1)
+    return parts
+
+
+@app.post("/brain/bootstrap")
+def brain_bootstrap(payload: Dict[str, str]):
+    vision = (payload.get("project_vision") or "").strip()
+    base = [
+        {"title": "Define acceptance criteria", "acceptance_criteria": "List DoD", "parent_id": None},
+        {"title": "Draft initial plan", "acceptance_criteria": "Outline milestones", "parent_id": None},
+        {"title": "Identify first deliverables", "acceptance_criteria": "3 tangible outputs", "parent_id": None},
+    ]
+    if vision:
+        base.insert(0, {"title": f"Clarify scope: {vision[:60]}", "acceptance_criteria": "Written scope", "parent_id": None})
+    return base
+
+
+@app.post("/brain/next")
+def brain_next(payload: Dict[str, str]):
+    sealed_id = payload.get("sealed_task_id") or ""
+    suggestions = [
+        {"title": f"Retrospective on {sealed_id}", "acceptance_criteria": "3 insights", "parent_id": None},
+        {"title": "Propose follow-up activity", "acceptance_criteria": "One atomic task", "parent_id": None},
+    ]
+    return suggestions
+
+
+@app.post("/brain/chat")
+def brain_chat(payload: Dict[str, str]):
+    user = payload.get("user_id") or "user"
+    message = payload.get("message") or ""
+    # Heuristic context: echo last 3 events of all tasks and last 3 comments of project if provided
+    response = f"Echo to {user}: '{message}'. Context not yet integrated."
+    return {"answer": response}
 
 
 # Background scheduler for SLA/session expiry
