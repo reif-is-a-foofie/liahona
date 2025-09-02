@@ -41,11 +41,17 @@ This document enumerates build tasks, subtasks, and testing methodology for each
 3. **Status Transition Guard**
    - Ensure tasks move only through allowed transitions (e.g., `activity` → `accepted`).
 
+4. **Action Sessions (Checkouts)**
+   - Add `ActionSession` model and endpoints under the Action primitive for checkout/update/heartbeat/release.
+   - Enforce exclusive session per task (unless released/expired/done).
+   - Append `action.started|action.progress|action.heartbeat|action.released|action.expired` events to `activity_log`.
+
 ### Testing Methodology
 - Integration tests calling each primitive endpoint and verifying status changes.
 - Negative tests ensuring invalid transitions return errors.
 - Mock Brain service for atomicity checks.
 - Run `pytest` for unit and integration tests.
+ - Tests for session exclusivity, updates, heartbeats, release, and activity events.
 
 ## Milestone 3 — SLA & Automation Layer (Week 3–4)
 
@@ -148,4 +154,3 @@ This document enumerates build tasks, subtasks, and testing methodology for each
 - Run `pytest` for backend and `npm test` for frontend regularly.
 - Use CI to enforce formatting (e.g., `black`, `eslint`) and type checks (`mypy`, `tsc`).
 - Document manual test cases for features without automation.
-

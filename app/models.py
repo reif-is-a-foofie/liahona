@@ -52,6 +52,7 @@ class ActivityEvent(BaseModel):
 class Task(BaseModel):
     id: str
     project_id: str
+    parent_id: Optional[str] = None
     title: str
     status: TaskStatus = TaskStatus.activity
     created_by: str
@@ -63,6 +64,84 @@ class Task(BaseModel):
     deliverables: List[Deliverable] = []
     comments: List[Comment] = []
     activity_log: List[ActivityEvent] = []
+    sealed_hash: Optional[str] = None
+
+
+# Request schemas for primitive endpoints
+class AcceptRequest(BaseModel):
+    user_id: str
+
+
+class ActionRequest(BaseModel):
+    user_id: str
+    note: Optional[str] = None
+
+
+class SubmitRequest(BaseModel):
+    user_id: str
+    deliverables: List[Deliverable]
+    note: Optional[str] = None
+
+
+class ConfirmRequest(BaseModel):
+    reviewer_id: str
+    decision: str  # approved|changes_requested
+    comment: Optional[str] = None
+
+
+class SealRequest(BaseModel):
+    system: bool = True
+
+
+class CommentCreate(BaseModel):
+    author_id: str
+    body: str
+    pinned: bool = False
+
+
+# --- Progress Tracking ---
+
+
+class ActionSessionStatus(str, Enum):
+    action = "action"
+    submitted = "submitted"
+    confirmed = "confirmed"
+    sealed = "sealed"
+    released = "released"
+
+
+class ActionSession(BaseModel):
+    id: str
+    task_id: str
+    agent_id: str
+    status: ActionSessionStatus = ActionSessionStatus.action
+    note: Optional[str] = None
+    file_paths: List[str] = []
+    percentage: Optional[int] = None
+    exclusive: bool = True
+    started_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    expires_at: Optional[datetime] = None
+    released_at: Optional[datetime] = None
+
+
+class ActionCheckoutRequest(BaseModel):
+    agent_id: str
+    file_paths: List[str] = []
+    note: Optional[str] = None
+    exclusive: bool = True
+    ttl_minutes: Optional[int] = 120
+
+
+class ActionSessionUpdateRequest(BaseModel):
+    status: Optional[ActionSessionStatus] = None
+    note: Optional[str] = None
+    file_paths: Optional[List[str]] = None
+    percentage: Optional[int] = None
+
+
+class ActionHeartbeatRequest(BaseModel):
+    ttl_minutes: Optional[int] = 60
 
 
 class User(BaseModel):
@@ -75,4 +154,3 @@ class Project(BaseModel):
     id: str
     title: str
     owner_id: str
-

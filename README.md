@@ -230,6 +230,38 @@ Liahona is an **open-source task federation system** — think *Git for consecra
 
 ---
 
+## Action Sessions (Checkouts)
+
+To keep strictly within the existing Six Verbs, coordination happens under the Action primitive via Action Sessions. A session represents a steward “doing the thing” with optional exclusivity and TTL.
+
+- Purpose: avoid overlap, capture what files are being touched, and show status without inventing a new verb.
+- Checkout: acquire an exclusive Action Session on a task (optional TTL). Others get 409 while active.
+- Updates: change status (in_progress/blocked/paused/done), notes, file paths, and percentage.
+- Heartbeats: extend TTL; sessions auto-release on expiration.
+- Release: end the session to free the task for others.
+
+API
+- POST `/tasks/{task_id}/action/checkout` → returns `ActionSession`.
+- GET `/tasks/{task_id}/action/sessions?active=true` → list sessions for a task.
+- GET `/action_sessions/{session_id}` → fetch a session.
+- PATCH `/action_sessions/{session_id}` → update status/note/file_paths/percentage.
+- POST `/action_sessions/{session_id}/heartbeat` → extend TTL.
+- POST `/action_sessions/{session_id}/release` → release session.
+
+Events
+- Appends `action.started|action.progress|action.heartbeat|action.released|action.expired` to `activity_log` and broadcasts over SSE.
+
+## Realtime SSE
+
+- Endpoint: `GET /rt/sse?project_id=<id>` streams server-sent events.
+- Event format: `event: <type>` lines with `data` containing JSON payload:
+  - `{ "type": "task.submitted", "project_id": "proj_...", "task_id": "task_...", "actor": "u_...", "ts": "...", "data": { ... } }`
+- Coverage: all logged events are also emitted, including `task.*`, `comment` (for comment created), `action.*`, and `sla.*`.
+- Test via curl:
+  - `curl -N http://localhost:8000/rt/sse?project_id=p1`
+
+---
+
 ## Real‑Time Updates (Events, Feeds, Outlines, Milestones)
 
 ### Goals
@@ -388,4 +420,3 @@ Liahona is an **open-source task federation system** — think *Git for consecra
 * **UI implements split-pane layout:** left Activity Tree and right chat-first Task View with subtasks, deliverables, and primitive controls.
 * Deployment live with functioning backend + frontend.
 * Immutable sealed history is verifiable via hash.
-
