@@ -4,6 +4,7 @@ from typing import Dict, List
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse
 import asyncio
 import os
 
@@ -530,11 +531,13 @@ def extend_sla(task_id: str, days: int, requested_by: str):
 @app.post("/admin/sla/scan")
 def admin_sla_scan(request: Request):
     # Superadmin guard (optional)
-    superadmins = set([x.strip() for x in (os.environ.get("SUPERADMINS") or "").split(",") if x.strip()])
-    # When SUPERADMINS is configured, require admin; otherwise open (dev mode)
-    if superadmins:
+    env_admins = set([x.strip() for x in (os.environ.get("SUPERADMINS") or "").split(",") if x.strip()])
+    # If not explicitly configured, default logical superadmin is 'reif'
+    effective_admins = env_admins if env_admins else {"reif"}
+    enforce = bool(env_admins) or (os.environ.get("REQUIRE_ADMIN", "false").lower() in ("1", "true", "yes"))
+    if enforce:
         user_id = request.headers.get("X-User-Id") or request.query_params.get("user_id")
-        if not user_id or user_id not in superadmins:
+        if not user_id or user_id not in effective_admins:
             raise HTTPException(status_code=403, detail="Forbidden; admin only")
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
     expired = db.expire_overdue_tasks(_iso(now))
@@ -675,6 +678,159 @@ def get_presence(project_id: str):
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# --- Minimal UI ---
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui_page():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Liahona UI (Minimal)</title>
+  <style>
+    body{font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0; background:#0b0f14; color:#e6edf3}
+    header{padding:10px 16px; background:#111724; position:sticky; top:0; z-index:2; display:flex; gap:12px; align-items:center}
+    input,button,select,textarea{background:#0f1522; color:#e6edf3; border:1px solid #243145; border-radius:6px; padding:8px}
+    button{cursor:pointer}
+    main{display:grid; grid-template-columns: 320px 1fr 380px; gap:10px; padding:10px}
+    .panel{background:#0f1522; border:1px solid #162235; border-radius:8px; padding:10px; height: calc(100vh - 80px); overflow:auto}
+    .task{padding:6px; border-bottom:1px solid #162235; cursor:pointer}
+    .task:hover{background:#10192a}
+    .badge{font-size:12px; padding:2px 6px; border-radius:6px; background:#1b2a40; color:#93c5fd}
+    .row{display:flex; gap:6px; align-items:center; margin:6px 0}
+    .col{display:flex; flex-direction:column; gap:6px}
+    .event{font-family: ui-monospace, Menlo, monospace; font-size:12px; border-bottom:1px dashed #283850; padding:6px 0}
+    .comment{border-bottom:1px dashed #283850; padding:6px 0}
+    .section{margin:10px 0; padding-bottom:8px; border-bottom:1px solid #162235}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <label>Project:</label>
+      <input id="proj" value="p1" size="10" />
+      <button onclick="loadAll()">Load</button>
+      <button onclick="connectSSE()">Connect SSE</button>
+    </div>
+    <div class="row">
+      <span id="counts"></span>
+    </div>
+  </header>
+  <main>
+    <div class="panel" id="left">
+      <div class="section"><b>Tasks</b></div>
+      <div id="tasks"></div>
+    </div>
+    <div class="panel" id="center">
+      <div class="section"><b>Task</b> <span id="task-id" class="badge"></span> <span id="task-status" class="badge"></span></div>
+      <div class="col">
+        <div id="task-title" style="font-size:18px; font-weight:600;"></div>
+        <div id="task-criteria" style="white-space:pre-wrap; color:#cbd5e1"></div>
+        <div class="section"><b>Actions</b></div>
+        <div class="row">
+          <button onclick="acceptTask()">Accept</button>
+          <input id="action-note" placeholder="Action note" />
+          <button onclick="doAction()">Action</button>
+        </div>
+        <div class="row">
+          <input id="deliv-url" placeholder="Deliverable url" size="30" />
+          <input id="submit-note" placeholder="Submit note" />
+          <button onclick="submitTask()">Submit</button>
+        </div>
+        <div class="row">
+          <select id="confirm-decision"><option>approved</option><option>changes_requested</option></select>
+          <input id="confirm-comment" placeholder="Confirm comment" />
+          <button onclick="confirmTask()">Confirm</button>
+          <button onclick="sealTask()">Seal</button>
+        </div>
+        <div class="row">
+          <input id="comment-body" placeholder="Add comment (@mention #ref)" size="40" />
+          <button onclick="addComment()">Comment</button>
+        </div>
+      </div>
+      <div class="section"><b>Comments</b></div>
+      <div id="comments"></div>
+    </div>
+    <div class="panel" id="right">
+      <div class="section"><b>Events</b></div>
+      <div id="events"></div>
+    </div>
+  </main>
+  <script>
+    const $ = (id)=>document.getElementById(id);
+    let currentTask = null;
+
+    async function jsonFetch(url, opts={}){
+      const r = await fetch(url, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+      if(!r.ok){ const t = await r.text(); throw new Error(r.status+': '+t); }
+      return await r.json();
+    }
+
+    async function loadOutline(){
+      const proj = $('proj').value.trim();
+      const data = await jsonFetch(`/projects/${encodeURIComponent(proj)}/outline`);
+      $('counts').innerText = Object.entries(data.counts).map(([k,v])=>`${k}:${v}`).join(' ');
+      const tasksDiv = $('tasks'); tasksDiv.innerHTML='';
+      const flat=[]; Object.values(data.children||{}).forEach(arr=>arr.forEach(x=>flat.push(x)));
+      flat.sort((a,b)=>a.title.localeCompare(b.title));
+      for(const t of flat){
+        const d = document.createElement('div'); d.className='task';
+        d.innerHTML = `<span class="badge">${t.status}</span> <b>${t.title}</b> <small style="opacity:.7">(${t.id})</small>`;
+        d.onclick = ()=>selectTask(t.id);
+        tasksDiv.appendChild(d);
+      }
+    }
+
+    async function loadAll(){ await loadOutline(); }
+
+    async function selectTask(id){
+      currentTask = id; $('task-id').innerText = id;
+      const t = await jsonFetch(`/tasks/${encodeURIComponent(id)}`);
+      $('task-title').innerText = t.title;
+      $('task-status').innerText = t.status;
+      $('task-criteria').innerText = t.acceptance_criteria||'';
+      await loadComments();
+    }
+
+    async function loadComments(){
+      if(!currentTask) return; const arr = await jsonFetch(`/tasks/${encodeURIComponent(currentTask)}/comments`);
+      const cdiv = $('comments'); cdiv.innerHTML='';
+      for(const c of arr){
+        const d = document.createElement('div'); d.className='comment';
+        d.innerHTML = `<b>${c.author_id}</b> <small>${new Date(c.timestamp).toLocaleString()}</small><br/>${escapeHtml(c.body)}`;
+        cdiv.appendChild(d);
+      }
+    }
+
+    async function acceptTask(){ if(!currentTask) return; await jsonFetch(`/tasks/${currentTask}/accept`, {method:'POST', body: JSON.stringify({user_id:'reif'})}); await selectTask(currentTask); await loadOutline(); }
+    async function doAction(){ if(!currentTask) return; const note=$('action-note').value; await jsonFetch(`/tasks/${currentTask}/action`, {method:'POST', body: JSON.stringify({user_id:'reif', note})}); await selectTask(currentTask); }
+    async function submitTask(){ if(!currentTask) return; const url=$('deliv-url').value; const note=$('submit-note').value; const del=[{id:'d'+Date.now(), type:'link', url, uploaded_by:'reif'}]; await jsonFetch(`/tasks/${currentTask}/submit`, {method:'POST', body: JSON.stringify({user_id:'reif', deliverables: del, note})}); await selectTask(currentTask); await loadOutline(); }
+    async function confirmTask(){ if(!currentTask) return; const decision=$('confirm-decision').value; const comment=$('confirm-comment').value; try{ await jsonFetch(`/tasks/${currentTask}/confirm`, {method:'POST', body: JSON.stringify({reviewer_id:'reif', decision, comment})}); }catch(e){ alert(e); } await selectTask(currentTask); await loadOutline(); }
+    async function sealTask(){ if(!currentTask) return; await jsonFetch(`/tasks/${currentTask}/seal`, {method:'POST', body: JSON.stringify({system:true})}); await selectTask(currentTask); await loadOutline(); }
+    async function addComment(){ if(!currentTask) return; const body=$('comment-body').value; await jsonFetch(`/tasks/${currentTask}/comments`, {method:'POST', body: JSON.stringify({author_id:'reif', body})}); $('comment-body').value=''; await loadComments(); }
+
+    function connectSSE(){
+      const proj = $('proj').value.trim();
+      const es = new EventSource(`/rt/sse?project_id=${encodeURIComponent(proj)}`);
+      const log = $('events');
+      es.onmessage = (e)=>{ try { const obj = JSON.parse(e.data); appendEvent(obj); } catch(err){} };
+      es.addEventListener('error', ()=>{ appendEvent({type:'sse.error'}); });
+      function appendEvent(evt){ const d=document.createElement('div'); d.className='event'; d.textContent = `${evt.ts||''} ${evt.type||''} ${evt.task_id||''}`; log.prepend(d); if(currentTask && evt.task_id===currentTask){ selectTask(currentTask); } if(evt.type && evt.type.startsWith('task.')){ loadOutline(); } }
+    }
+
+    function escapeHtml(s){ return (s||'').replace(/[&<>\"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+
+    // Initial load
+    loadAll();
+  </script>
+</body>
+</html>
+    """
 
 
 # Notifications endpoints
