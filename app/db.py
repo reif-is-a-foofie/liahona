@@ -82,6 +82,15 @@ def init_db() -> None:
         )
         _exec(
             """
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                owner_id TEXT NOT NULL
+            );
+            """
+        )
+        _exec(
+            """
             CREATE TABLE IF NOT EXISTS activity_events (
                 id BIGSERIAL PRIMARY KEY,
                 task_id TEXT NOT NULL,
@@ -153,6 +162,15 @@ def init_db() -> None:
                 sla_extended_days INTEGER DEFAULT 0,
                 acceptance_criteria TEXT,
                 sealed_hash TEXT
+            );
+            """
+        )
+        _exec(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                owner_id TEXT NOT NULL
             );
             """
         )
@@ -576,11 +594,35 @@ def mark_notification_read(note_id: str) -> None:
 
 def list_tasks_by_project(project_id: str) -> List[Dict[str, Any]]:
     cur = _exec(
-        "SELECT id, parent_id, title, status, created_at FROM tasks WHERE project_id=? ORDER BY created_at ASC",
+        "SELECT id, parent_id, title, status, created_at, owner_id FROM tasks WHERE project_id=? ORDER BY created_at ASC",
         (project_id,),
     )
     rows = cur.fetchall()
     return [
-        {"id": r[0], "parent_id": r[1], "title": r[2], "status": r[3], "created_at": r[4]}
+        {"id": r[0], "parent_id": r[1], "title": r[2], "status": r[3], "created_at": r[4], "owner_id": r[5]}
         for r in rows
     ]
+
+
+# ---- Projects ----
+
+
+def insert_project(project: Dict[str, Any]) -> None:
+    with tx() as conn:
+        _exec(
+            "INSERT INTO projects (id, title, owner_id) VALUES (?, ?, ?)",
+            (project["id"], project["title"], project["owner_id"]),
+        )
+
+
+def get_project(project_id: str) -> Optional[Dict[str, Any]]:
+    cur = _exec("SELECT id, title, owner_id FROM projects WHERE id=?", (project_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "title": row[1], "owner_id": row[2]}
+
+
+def list_projects() -> List[Dict[str, Any]]:
+    cur = _exec("SELECT id, title, owner_id FROM projects ORDER BY id ASC", ())
+    return [{"id": r[0], "title": r[1], "owner_id": r[2]} for r in cur.fetchall()]

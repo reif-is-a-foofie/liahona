@@ -65,6 +65,35 @@ def create_task(task: Task):
     return _task_from_db(db.get_task(task.id))
 
 
+# --- Projects ---
+
+
+@app.post("/projects")
+def create_project(project: Dict[str, str]):
+    pid = (project.get("id") or "").strip()
+    title = (project.get("title") or "").strip()
+    owner = (project.get("owner_id") or "").strip() or "reif"
+    if not pid or not title:
+        raise HTTPException(status_code=400, detail="id and title required")
+    if db.get_project(pid):
+        raise HTTPException(status_code=400, detail="Project exists")
+    db.insert_project({"id": pid, "title": title, "owner_id": owner})
+    return db.get_project(pid)
+
+
+@app.get("/projects")
+def list_projects():
+    return db.list_projects()
+
+
+@app.get("/projects/{project_id}")
+def get_project(project_id: str):
+    p = db.get_project(project_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Not found")
+    return p
+
+
 @app.get("/tasks/{task_id}", response_model=Task)
 def read_task(task_id: str):
     t = db.get_task(task_id)
@@ -558,6 +587,49 @@ def admin_sla_scan(request: Request):
     return {"expired": [r["id"] for r in expired]}
 
 
+@app.post("/admin/seed")
+def seed_demo(project_id: str, request: Request):
+    env_admins = set([x.strip() for x in (os.environ.get("SUPERADMINS") or "").split(",") if x.strip()])
+    effective_admins = env_admins if env_admins else {"reif"}
+    enforce = bool(env_admins) or (os.environ.get("REQUIRE_ADMIN", "false").lower() in ("1", "true", "yes"))
+    if enforce:
+        user_id = request.headers.get("X-User-Id") or request.query_params.get("user_id")
+        if not user_id or user_id not in effective_admins:
+            raise HTTPException(status_code=403, detail="Forbidden; admin only")
+    if not db.get_project(project_id):
+        db.insert_project({"id": project_id, "title": f"Project {project_id}", "owner_id": "reif"})
+    import uuid
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    samples = [
+        ("Draft README", "README includes vision and milestones"),
+        ("Set up CI", "Pytest runs and passes on push"),
+        ("Create landing copy", "Hero, subheading, CTA"),
+    ]
+    created = []
+    for title, crit in samples:
+        tid = f"t_{uuid.uuid4().hex[:8]}"
+        if not db.get_task(tid):
+            db.insert_task({
+                "id": tid,
+                "project_id": project_id,
+                "parent_id": None,
+                "title": title,
+                "status": TaskStatus.activity.value,
+                "created_by": "reif",
+                "owner_id": None,
+                "created_at": _iso(now),
+                "accepted_at": None,
+                "sla_phase": TaskStatus.activity.value,
+                "sla_due_at": None,
+                "sla_extended_days": 0,
+                "acceptance_criteria": crit,
+                "sealed_hash": None,
+            })
+            db.add_activity_event(tid, "create", "reif", _iso(now), {})
+            created.append(tid)
+    return {"created": created}
+
+
 # --- Realtime SSE (Milestone: Goals / M2-M3 minimal stream) ---
 
 
@@ -714,11 +786,18 @@ def ui_page():
     <div class="row">
       <label>Project:</label>
       <input id="proj" value="p1" size="10" />
-      <button onclick="loadAll()">Load</button>
+      <label>User:</label>
+      <input id="user" value="reif" size="10" />
+      <button onclick="persistSettings(); loadAll()">Load</button>
+      <button onclick="createProject()">Create Project</button>
+      <button onclick="seedDemo()">Seed Demo</button>
       <button onclick="connectSSE()">Connect SSE</button>
+      <button onclick="connectWS()">Connect WS</button>
     </div>
-    <div class="row">
+    <div class="row" style="gap:16px">
       <span id="counts"></span>
+      <span>Online: <span id="presence"></span></span>
+      <span id="typing" style="opacity:.7"></span>
     </div>
   </header>
   <main>
@@ -731,6 +810,15 @@ def ui_page():
       <div class="col">
         <div id="task-title" style="font-size:18px; font-weight:600;"></div>
         <div id="task-criteria" style="white-space:pre-wrap; color:#cbd5e1"></div>
+        <div class="section"><b>Create Activity</b></div>
+        <div class="col">
+          <input id="new-title" placeholder="Short, atomic title (verb phrase)" size="40" />
+          <textarea id="new-criteria" placeholder="Acceptance criteria" rows="3"></textarea>
+          <label><input type="checkbox" id="new-sub" /> Subtask of selected</label>
+          <div class="row">
+            <button onclick="createActivity()">Create</button>
+          </div>
+        </div>
         <div class="section"><b>Actions</b></div>
         <div class="row">
           <button onclick="acceptTask()">Accept</button>
@@ -764,6 +852,8 @@ def ui_page():
   <script>
     const $ = (id)=>document.getElementById(id);
     let currentTask = null;
+    let ws = null;
+    let typingTimer = null;
 
     async function jsonFetch(url, opts={}){
       const r = await fetch(url, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
@@ -771,10 +861,25 @@ def ui_page():
       return await r.json();
     }
 
+    function persistSettings(){
+      localStorage.setItem('liahona_project', $('proj').value.trim());
+      localStorage.setItem('liahona_user', $('user').value.trim());
+    }
+
+    function loadSettings(){
+      const p = localStorage.getItem('liahona_project'); if(p) $('proj').value = p;
+      const u = localStorage.getItem('liahona_user'); if(u) $('user').value = u;
+    }
+
     async function loadOutline(){
       const proj = $('proj').value.trim();
       const data = await jsonFetch(`/projects/${encodeURIComponent(proj)}/outline`);
       $('counts').innerText = Object.entries(data.counts).map(([k,v])=>`${k}:${v}`).join(' ');
+      // Presence list
+      try{
+        const pres = await jsonFetch(`/rt/presence?project_id=${encodeURIComponent(proj)}`);
+        $('presence').innerText = Array.isArray(pres) ? pres.join(', ') : '';
+      }catch(e){ $('presence').innerText=''; }
       const tasksDiv = $('tasks'); tasksDiv.innerHTML='';
       const flat=[]; Object.values(data.children||{}).forEach(arr=>arr.forEach(x=>flat.push(x)));
       flat.sort((a,b)=>a.title.localeCompare(b.title));
@@ -807,12 +912,36 @@ def ui_page():
       }
     }
 
-    async function acceptTask(){ if(!currentTask) return; await jsonFetch(`/tasks/${currentTask}/accept`, {method:'POST', body: JSON.stringify({user_id:'reif'})}); await selectTask(currentTask); await loadOutline(); }
-    async function doAction(){ if(!currentTask) return; const note=$('action-note').value; await jsonFetch(`/tasks/${currentTask}/action`, {method:'POST', body: JSON.stringify({user_id:'reif', note})}); await selectTask(currentTask); }
-    async function submitTask(){ if(!currentTask) return; const url=$('deliv-url').value; const note=$('submit-note').value; const del=[{id:'d'+Date.now(), type:'link', url, uploaded_by:'reif'}]; await jsonFetch(`/tasks/${currentTask}/submit`, {method:'POST', body: JSON.stringify({user_id:'reif', deliverables: del, note})}); await selectTask(currentTask); await loadOutline(); }
-    async function confirmTask(){ if(!currentTask) return; const decision=$('confirm-decision').value; const comment=$('confirm-comment').value; try{ await jsonFetch(`/tasks/${currentTask}/confirm`, {method:'POST', body: JSON.stringify({reviewer_id:'reif', decision, comment})}); }catch(e){ alert(e); } await selectTask(currentTask); await loadOutline(); }
+    function user(){ return $('user').value.trim() || 'reif'; }
+    async function acceptTask(){ if(!currentTask) return; await jsonFetch(`/tasks/${currentTask}/accept`, {method:'POST', body: JSON.stringify({user_id:user()})}); await selectTask(currentTask); await loadOutline(); }
+    async function doAction(){ if(!currentTask) return; const note=$('action-note').value; await jsonFetch(`/tasks/${currentTask}/action`, {method:'POST', body: JSON.stringify({user_id:user(), note})}); await selectTask(currentTask); }
+    async function submitTask(){ if(!currentTask) return; const url=$('deliv-url').value; const note=$('submit-note').value; const del=[{id:'d'+Date.now(), type:'link', url, uploaded_by:user()}]; await jsonFetch(`/tasks/${currentTask}/submit`, {method:'POST', body: JSON.stringify({user_id:user(), deliverables: del, note})}); await selectTask(currentTask); await loadOutline(); }
+    async function confirmTask(){ if(!currentTask) return; const decision=$('confirm-decision').value; const comment=$('confirm-comment').value; try{ await jsonFetch(`/tasks/${currentTask}/confirm`, {method:'POST', body: JSON.stringify({reviewer_id:user(), decision, comment})}); }catch(e){ alert(e); } await selectTask(currentTask); await loadOutline(); }
     async function sealTask(){ if(!currentTask) return; await jsonFetch(`/tasks/${currentTask}/seal`, {method:'POST', body: JSON.stringify({system:true})}); await selectTask(currentTask); await loadOutline(); }
-    async function addComment(){ if(!currentTask) return; const body=$('comment-body').value; await jsonFetch(`/tasks/${currentTask}/comments`, {method:'POST', body: JSON.stringify({author_id:'reif', body})}); $('comment-body').value=''; await loadComments(); }
+    async function addComment(){ if(!currentTask) return; const body=$('comment-body').value; await jsonFetch(`/tasks/${currentTask}/comments`, {method:'POST', body: JSON.stringify({author_id:user(), body})}); $('comment-body').value=''; await loadComments(); }
+
+    async function createActivity(){
+      const proj=$('proj').value.trim(), title=$('new-title').value.trim(), criteria=$('new-criteria').value, sub=$('new-sub').checked;
+      if(!title){ alert('Title required'); return; }
+      const id = 't_'+Date.now();
+      const payload = { id, project_id: proj, title, created_by: user(), acceptance_criteria: criteria };
+      if(sub && currentTask) payload.parent_id = currentTask;
+      await jsonFetch('/tasks', {method:'POST', body: JSON.stringify(payload)});
+      $('new-title').value=''; $('new-criteria').value=''; $('new-sub').checked=false;
+      await loadOutline();
+    }
+    async function createProject(){
+      const pid = $('proj').value.trim();
+      const title = prompt('Project title:', pid || 'New Project');
+      if(!pid || !title) return;
+      try{ await jsonFetch('/projects', {method:'POST', body: JSON.stringify({id: pid, title, owner_id: user()})}); }catch(e){ alert(e); }
+      await loadOutline();
+    }
+    async function seedDemo(){
+      const pid = $('proj').value.trim();
+      try{ await jsonFetch(`/admin/seed?project_id=${encodeURIComponent(pid)}`, {method:'POST'}); }catch(e){ alert(e); }
+      await loadOutline();
+    }
 
     function connectSSE(){
       const proj = $('proj').value.trim();
@@ -823,9 +952,39 @@ def ui_page():
       function appendEvent(evt){ const d=document.createElement('div'); d.className='event'; d.textContent = `${evt.ts||''} ${evt.type||''} ${evt.task_id||''}`; log.prepend(d); if(currentTask && evt.task_id===currentTask){ selectTask(currentTask); } if(evt.type && evt.type.startsWith('task.')){ loadOutline(); } }
     }
 
+    function connectWS(){
+      try{ if(ws) ws.close(); }catch(e){}
+      const proj = $('proj').value.trim(); const uid = user();
+      ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/rt/ws');
+      ws.onopen = ()=>{ ws.send(JSON.stringify({subscribe:[`project:${proj}`], user_id: uid})); };
+      ws.onmessage = (ev)=>{ try{ const e = JSON.parse(ev.data||'{}'); handleWSEvent(e); }catch(err){} };
+      ws.onerror = ()=>{};
+      const input=$('comment-body');
+      input.addEventListener('input', ()=>{
+        clearTimeout(typingTimer);
+        typingTimer = setTimeout(()=>{
+          try{ ws && ws.send(JSON.stringify({type:'typing', project_id: proj, task_id: currentTask})); }catch(err){}
+        }, 200);
+      });
+    }
+
+    function handleWSEvent(evt){
+      if(!evt || !evt.type) return;
+      if(evt.type==='presence.join' || evt.type==='presence.leave'){
+        loadOutline(); // refresh presence list
+      }
+      if(evt.type==='presence.typing'){
+        if(evt.task_id && currentTask && evt.task_id===currentTask){
+          $('typing').innerText = `${evt.actor||'someone'} is typing...`;
+          setTimeout(()=>{ $('typing').innerText=''; }, 1200);
+        }
+      }
+    }
+
     function escapeHtml(s){ return (s||'').replace(/[&<>\"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
 
     // Initial load
+    loadSettings();
     loadAll();
   </script>
 </body>
@@ -856,7 +1015,7 @@ def project_outline(project_id: str):
     children: Dict[str, List[Dict[str, str]]] = {}
     for t in tasks:
         pid = t.get("parent_id") or "root"
-        children.setdefault(pid, []).append({"id": t["id"], "title": t["title"], "status": t["status"]})
+        children.setdefault(pid, []).append({"id": t["id"], "title": t["title"], "status": t["status"], "owner_id": t.get("owner_id")})
     counts: Dict[str, int] = {}
     for t in tasks:
         counts[t["status"]] = counts.get(t["status"], 0) + 1
