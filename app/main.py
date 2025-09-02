@@ -5,6 +5,7 @@ from typing import Dict, List
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 import asyncio
+import os
 
 from .models import (
     ActivityEvent,
@@ -727,13 +728,26 @@ def project_feed(project_id: str):
 @app.post("/brain/split")
 def brain_split(task_title: Dict[str, str]):
     title = (task_title.get("task_title") or "").strip()
+    client = _get_openai()
+    if client:
+        try:
+            # Ask model to split into atomic actions
+            prompt = f"Split the following task title into 2-6 atomic, single-verb actions. Return a JSON array of strings only. Title: {title}"
+            resp = client.responses.create(model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"), input=prompt)
+            txt = resp.output_text  # type: ignore
+            import json as _json
+            arr = _json.loads(txt)
+            if isinstance(arr, list):
+                return [str(x) for x in arr if str(x).strip()]
+        except Exception:
+            pass
+    # Heuristic fallback
     parts = []
     for sep in [" and ", ";", ",", " & "]:
         if sep in title.lower():
             parts = [p.strip().capitalize() for p in title.replace(";", ",").split(sep) if p.strip()]
             break
     if not parts:
-        # Try to extract two verbs heuristically
         import re
         verbs = re.findall(r"\b([a-z]{3,}?)\b", title.lower())
         parts = [title] if len(verbs) <= 1 else title.split(" ", 1)
@@ -743,6 +757,22 @@ def brain_split(task_title: Dict[str, str]):
 @app.post("/brain/bootstrap")
 def brain_bootstrap(payload: Dict[str, str]):
     vision = (payload.get("project_vision") or "").strip()
+    client = _get_openai()
+    if client and vision:
+        try:
+            prompt = (
+                "You are a planner. Produce 5-10 atomic Activity task suggestions from this vision. "
+                "Return only a JSON array of objects: {title, acceptance_criteria, parent_id:null}. Vision: " + vision
+            )
+            resp = client.responses.create(model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"), input=prompt)
+            txt = resp.output_text  # type: ignore
+            import json as _json
+            arr = _json.loads(txt)
+            if isinstance(arr, list):
+                return arr
+        except Exception:
+            pass
+    # Fallback starter list
     base = [
         {"title": "Define acceptance criteria", "acceptance_criteria": "List DoD", "parent_id": None},
         {"title": "Draft initial plan", "acceptance_criteria": "Outline milestones", "parent_id": None},
@@ -756,18 +786,46 @@ def brain_bootstrap(payload: Dict[str, str]):
 @app.post("/brain/next")
 def brain_next(payload: Dict[str, str]):
     sealed_id = payload.get("sealed_task_id") or ""
-    suggestions = [
+    client = _get_openai()
+    if client and sealed_id:
+        try:
+            prompt = (
+                f"Suggest 3-6 follow-up atomic Activities after sealing task {sealed_id}. "
+                "Return JSON array of {title, acceptance_criteria, parent_id:null}."
+            )
+            resp = client.responses.create(model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"), input=prompt)
+            txt = resp.output_text  # type: ignore
+            import json as _json
+            arr = _json.loads(txt)
+            if isinstance(arr, list):
+                return arr
+        except Exception:
+            pass
+    return [
         {"title": f"Retrospective on {sealed_id}", "acceptance_criteria": "3 insights", "parent_id": None},
         {"title": "Propose follow-up activity", "acceptance_criteria": "One atomic task", "parent_id": None},
     ]
-    return suggestions
 
 
 @app.post("/brain/chat")
 def brain_chat(payload: Dict[str, str]):
     user = payload.get("user_id") or "user"
     message = payload.get("message") or ""
-    # Heuristic context: echo last 3 events of all tasks and last 3 comments of project if provided
+    client = _get_openai()
+    if client and message:
+        try:
+            resp = client.chat.completions.create(
+                model=os.environ.get("OPENAI_MODEL","gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": "You are Liahona's Brain. Answer concisely with actionable guidance."},
+                    {"role": "user", "content": message},
+                ],
+            )
+            text = resp.choices[0].message.content  # type: ignore
+            return {"answer": text}
+        except Exception:
+            pass
+    # Fallback
     response = f"Echo to {user}: '{message}'. Context not yet integrated."
     return {"answer": response}
 
@@ -796,3 +854,18 @@ async def start_background_jobs():
     except RuntimeError:
         # Not in async loop (tests), ignore
         pass
+# --- Optional OpenAI client ---
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
+
+
+def _get_openai() -> object | None:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key or OpenAI is None:
+        return None
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    if base_url:
+        return OpenAI(api_key=api_key, base_url=base_url)
+    return OpenAI(api_key=api_key)

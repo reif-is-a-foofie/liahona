@@ -186,6 +186,10 @@ Liahona is an **open-source task federation system** — think *Git for consecra
 
 ### **Brain (OpenAI Integration)**
 
+Setup
+- Set `OPENAI_API_KEY` (and optional `OPENAI_BASE_URL`, `OPENAI_MODEL` e.g. `gpt-4o-mini`).
+- If unset, endpoints fall back to simple heuristics.
+
 * **Bootstrap Tasks**: `/brain/bootstrap`
 
   ```json

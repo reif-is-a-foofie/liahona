@@ -3,4 +3,5 @@ uvicorn
 pydantic
 pytest
 httpx
+openai>=1.30.0
 psycopg[binary]
