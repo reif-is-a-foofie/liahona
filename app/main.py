@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Dict, List
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import StreamingResponse
 import asyncio
 import os
@@ -528,7 +528,14 @@ def extend_sla(task_id: str, days: int, requested_by: str):
 
 
 @app.post("/admin/sla/scan")
-def admin_sla_scan():
+def admin_sla_scan(request: Request):
+    # Superadmin guard (optional)
+    superadmins = set([x.strip() for x in (os.environ.get("SUPERADMINS") or "").split(",") if x.strip()])
+    # When SUPERADMINS is configured, require admin; otherwise open (dev mode)
+    if superadmins:
+        user_id = request.headers.get("X-User-Id") or request.query_params.get("user_id")
+        if not user_id or user_id not in superadmins:
+            raise HTTPException(status_code=403, detail="Forbidden; admin only")
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
     expired = db.expire_overdue_tasks(_iso(now))
     for rec in expired:
@@ -589,6 +596,15 @@ async def ws_endpoint(websocket: WebSocket):
             msg = {}
         subs = msg.get("subscribe") or []
         user_id = msg.get("user_id")
+        # Optional auth gate
+        required = os.environ.get("REQUIRE_AUTH", "false").lower() in ("1","true","yes")
+        superadmins = set([x.strip() for x in (os.environ.get("SUPERADMINS") or "").split(",") if x.strip()])
+        if required and not user_id:
+            await websocket.close(code=4401)
+            return
+        if required and superadmins and user_id not in superadmins:
+            # Allow non-admins to subscribe but note presence as non-admin
+            pass
         for s in subs:
             if isinstance(s, str) and s.startswith("project:"):
                 topics_projects.add(s.split(":", 1)[1])
@@ -651,6 +667,14 @@ async def ws_endpoint(websocket: WebSocket):
 @app.get("/rt/presence")
 def get_presence(project_id: str):
     return sorted(list(presence.get(project_id, set())))
+
+
+# --- Health ---
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
 # Notifications endpoints
